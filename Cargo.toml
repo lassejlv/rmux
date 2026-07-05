@@ -1,0 +1,18 @@
+[package]
+name = "rmux"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rmux"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+termy_core = { git = "https://github.com/lassejlv/termy", package = "termy_core", rev = "99cbcedcf6dc2101460e6fa61aa1dc2c2da95fd9" }
+unicode-width = "0.2"

@@ -1,0 +1,33 @@
+{
+  "name": "@lassejlv/rmux",
+  "version": "0.1.0",
+  "description": "A tiny tmux-style terminal multiplexer backed by libtermy",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lassejlv/rmux.git"
+  },
+  "bin": {
+    "rmux": "bin/rmux.js"
+  },
+  "files": [
+    "bin/rmux.js",
+    "install.js"
+  ],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "tmux",
+    "terminal",
+    "multiplexer",
+    "cli"
+  ]
+}
