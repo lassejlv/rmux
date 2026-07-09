@@ -619,6 +619,10 @@ enum Command {
         /// Milliseconds to hold the socket open.
         #[arg(long, default_value_t = 1000)]
         millis: u64,
+
+        /// File to create after the server answers the first snapshot request.
+        #[arg(long)]
+        ready_file: Option<String>,
     },
 }
 
@@ -919,7 +923,11 @@ fn main() -> Result<()> {
             capture_pane(parse_target(&target, &target)?, CaptureMode::AllPanes)
         }
         Some(Command::ShutdownServer { target }) => kill_session(&target),
-        Some(Command::HoldClient { target, millis }) => hold_client(&target, millis),
+        Some(Command::HoldClient {
+            target,
+            millis,
+            ready_file,
+        }) => hold_client(&target, millis, ready_file.as_deref()),
         None => run(LaunchOptions {
             session: args.session,
             command: args.shell_command,
@@ -1784,7 +1792,7 @@ fn kill_server() -> Result<()> {
     }
 }
 
-fn hold_client(session: &str, millis: u64) -> Result<()> {
+fn hold_client(session: &str, millis: u64, mut ready_file: Option<&str>) -> Result<()> {
     let mut client = connect_session(session)?;
     let deadline = Instant::now() + Duration::from_millis(millis);
     while Instant::now() < deadline {
@@ -1795,6 +1803,9 @@ fn hold_client(session: &str, millis: u64) -> Result<()> {
         };
         match response {
             ServerResponse::View(_) | ServerResponse::Noop => {
+                if let Some(path) = ready_file.take() {
+                    fs::write(path, b"ready\n").context("write hold-client ready file")?;
+                }
                 thread::sleep(Duration::from_millis(25))
             }
             ServerResponse::Detached | ServerResponse::Shutdown => return Ok(()),
@@ -3481,10 +3492,25 @@ mod tests {
             Some(Command::ShutdownServer { target }) if target == "work"
         ));
 
-        let args = Args::parse_from(["rmux", "hold-client", "--target", "work", "--millis", "25"]);
+        let args = Args::parse_from([
+            "rmux",
+            "hold-client",
+            "--target",
+            "work",
+            "--millis",
+            "25",
+            "--ready-file",
+            "/tmp/rmux-ready",
+        ]);
         assert!(matches!(
             args.command,
-            Some(Command::HoldClient { target, millis }) if target == "work" && millis == 25
+            Some(Command::HoldClient {
+                target,
+                millis,
+                ready_file,
+            }) if target == "work"
+                && millis == 25
+                && ready_file.as_deref() == Some("/tmp/rmux-ready")
         ));
     }
 

@@ -19,6 +19,7 @@ socket="/tmp/rmux-${USER}/${session}.sock"
 source_file="/tmp/rmux-source-$$.conf"
 invalid_target_log="/tmp/rmux-invalid-target-$$.log"
 protected_kill_log="/tmp/rmux-protected-kill-$$.log"
+hold_ready_file="/tmp/rmux-hold-ready-$$"
 
 cleanup() {
   ./target/debug/rmux kill-session -t "$session" >/dev/null 2>&1 || true
@@ -31,6 +32,7 @@ cleanup() {
   rm -f "$source_file"
   rm -f "$invalid_target_log"
   rm -f "$protected_kill_log"
+  rm -f "$hold_ready_file"
 }
 trap cleanup EXIT
 
@@ -111,8 +113,26 @@ fi
 ./target/debug/rmux send-keys -t "$session" --literal "LITERAL_Enter_Tab" Enter
 ./target/debug/rmux send-keys -t "$session" Enter
 
-./target/debug/rmux hold-client -t "$session" --millis 5000 &
+rm -f "$hold_ready_file"
+./target/debug/rmux hold-client -t "$session" --millis 5000 --ready-file "$hold_ready_file" &
 hold_pid=$!
+for _ in {1..100}; do
+  if [[ -f "$hold_ready_file" ]]; then
+    break
+  fi
+  if ! kill -0 "$hold_pid" 2>/dev/null; then
+    wait "$hold_pid" 2>/dev/null || true
+    echo "held client exited before becoming ready" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+if [[ ! -f "$hold_ready_file" ]]; then
+  echo "held client did not become ready" >&2
+  kill "$hold_pid" 2>/dev/null || true
+  wait "$hold_pid" 2>/dev/null || true
+  exit 1
+fi
 ./target/debug/rmux detach-client -t "$session"
 for _ in {1..40}; do
   if ! kill -0 "$hold_pid" 2>/dev/null; then
