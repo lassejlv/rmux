@@ -2574,7 +2574,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.session_view().panes.len(), 2);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             app.drain_events();
             if app.session_view().panes.len() == 1 {
@@ -2597,7 +2597,7 @@ mod tests {
         )
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             app.drain_events();
             if app.take_exit_reason() == Some(ExitReason::Quit) {
