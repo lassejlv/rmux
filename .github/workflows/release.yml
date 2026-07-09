@@ -12,13 +12,13 @@ jobs:
   validate:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 24
       - name: Check formatting
         run: cargo fmt --check
       - name: Run Clippy
@@ -44,7 +44,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset: rmux-darwin-arm64
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             asset: rmux-darwin-x64
           - os: ubuntu-24.04
@@ -54,7 +54,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             asset: rmux-linux-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -76,10 +76,10 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
       - name: Sync package version with tag
         run: npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
