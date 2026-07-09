@@ -1,5 +1,5 @@
 {
-  "name": "@lassejlv/rmux",
+  "name": "@cookedoss/rmux",
   "version": "0.1.0",
   "description": "A tiny tmux-style terminal multiplexer backed by libtermy",
   "license": "MIT",

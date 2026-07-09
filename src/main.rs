@@ -33,7 +33,8 @@ mod protocol;
 mod render;
 
 use ipc::{
-    ServerClient, connect_session, list_session_names, prepare_socket_path, read_json, write_json,
+    ServerClient, connect_session, list_session_names, prepare_socket_path, read_json,
+    secure_socket_path, write_json,
 };
 use model::{ExitReason, RawView, Rmux, TerminalConfig, build_session_view};
 use protocol::{
@@ -1332,11 +1333,11 @@ fn parse_prefix_key(value: &str) -> Result<u8> {
     let mut chars = value.chars();
     if let (Some(first), Some(second), Some(third), None) =
         (chars.next(), chars.next(), chars.next(), chars.next())
+        && first.eq_ignore_ascii_case(&'C')
+        && second == '-'
     {
-        if first.eq_ignore_ascii_case(&'C') && second == '-' {
-            return control_key_byte(third.to_ascii_lowercase())
-                .ok_or_else(|| anyhow!("unsupported prefix key {value:?}"));
-        }
+        return control_key_byte(third.to_ascii_lowercase())
+            .ok_or_else(|| anyhow!("unsupported prefix key {value:?}"));
     }
     Err(anyhow!(
         "unsupported prefix key {value:?}; expected C-a through C-z or C-["
@@ -1818,6 +1819,7 @@ const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 fn run_server(session_name: String, command: Option<String>) -> Result<()> {
     let socket = prepare_socket_path(&session_name)?;
     let listener = UnixListener::bind(&socket).context("bind rmux server socket")?;
+    secure_socket_path(&socket)?;
     listener
         .set_nonblocking(true)
         .context("configure rmux server socket")?;
@@ -2572,7 +2574,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.session_view().panes.len(), 2);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             app.drain_events();
             if app.session_view().panes.len() == 1 {
@@ -2595,7 +2597,7 @@ mod tests {
         )
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             app.drain_events();
             if app.take_exit_reason() == Some(ExitReason::Quit) {

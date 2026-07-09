@@ -18,7 +18,7 @@ Termy uses.
 With npm (downloads a prebuilt binary for macOS/Linux from GitHub Releases):
 
 ```sh
-npm install -g @lassejlv/rmux
+npm install -g @cookedoss/rmux
 rmux
 ```
 
@@ -152,7 +152,9 @@ server session.
 
 ```sh
 cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
 cargo test
 cargo run -- --help
+node --test npm/install.test.js
 ./scripts/smoke-detach-attach.sh
 ```

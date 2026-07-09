@@ -46,13 +46,10 @@ pub fn build_session_view(raw: RawView) -> SessionView {
     let mut panes = Vec::with_capacity(raw.panes.len());
     for rp in raw.panes {
         let (cells, lines) = frame_cells_and_text_lines(&rp.frame, rp.max_width);
-        let cursor = rp
-            .frame
-            .cursor
-            .map(|cursor| crate::protocol::CursorView {
-                col: cursor.col,
-                row: cursor.row,
-            });
+        let cursor = rp.frame.cursor.map(|cursor| crate::protocol::CursorView {
+            col: cursor.col,
+            row: cursor.row,
+        });
         panes.push(PaneView {
             id: rp.id,
             x: rp.rect.x,
@@ -396,19 +393,17 @@ impl PaneLayout {
     }
 
     fn pane_weights(&self, pane_count: usize) -> Vec<u16> {
-        if pane_count == 2 {
-            if let Self::Split {
+        if pane_count == 2
+            && let Self::Split {
                 first_weight,
                 second_weight,
                 first,
                 second,
                 ..
             } = self
-            {
-                if matches!((&**first, &**second), (Self::Leaf(0), Self::Leaf(1))) {
-                    return vec![*first_weight, *second_weight];
-                }
-            }
+            && matches!((&**first, &**second), (Self::Leaf(0), Self::Leaf(1)))
+        {
+            return vec![*first_weight, *second_weight];
         }
         vec![EVEN_PANE_WEIGHT; pane_count]
     }
@@ -1743,16 +1738,18 @@ fn terminal_shortcut(key: KeyEvent) -> Option<TerminalShortcut> {
         return Some(TerminalShortcut::NewWindow);
     }
 
-    if has_ctrl || has_super {
-        if let Some(index) = shortcut_window_index(ch) {
-            return Some(TerminalShortcut::SelectWindow(index as usize));
-        }
+    if (has_ctrl || has_super)
+        && let Some(index) = shortcut_window_index(ch)
+    {
+        return Some(TerminalShortcut::SelectWindow(index as usize));
     }
 
-    if has_alt && !has_ctrl && !has_super {
-        if let Some(index) = shortcut_window_index(ch) {
-            return Some(TerminalShortcut::SelectWindow(index as usize));
-        }
+    if has_alt
+        && !has_ctrl
+        && !has_super
+        && let Some(index) = shortcut_window_index(ch)
+    {
+        return Some(TerminalShortcut::SelectWindow(index as usize));
     }
 
     if ch.eq_ignore_ascii_case(&'d') && (has_ctrl || has_super) {
@@ -1831,10 +1828,10 @@ fn control_byte(ch: char) -> Option<u8> {
 }
 
 fn key_matches_byte(key: KeyEvent, byte: u8) -> bool {
-    if let KeyCode::Char(ch) = key.code {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return control_byte(ch) == Some(byte);
-        }
+    if let KeyCode::Char(ch) = key.code
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return control_byte(ch) == Some(byte);
     }
     false
 }
