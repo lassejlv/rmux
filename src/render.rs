@@ -49,26 +49,24 @@ pub fn draw_view(frame: &mut ratatui::Frame<'_>, view: &SessionView) {
             Paragraph::new(pane_terminal_lines(pane))
         };
         frame.render_widget(paragraph, rect);
-        if is_active {
-            if let Some(cursor) = pane.cursor {
-                let offset = u16::from(framed);
-                let cursor_x =
-                    rect.x.saturating_add(offset).saturating_add(
-                        cursor.col.min(usize::from(pane.cols.saturating_sub(1))) as u16,
-                    );
-                let cursor_y =
-                    rect.y.saturating_add(offset).saturating_add(
-                        cursor.row.min(usize::from(pane.rows.saturating_sub(1))) as u16,
-                    );
-                let right_limit = rect
-                    .x
-                    .saturating_add(rect.width.saturating_sub(u16::from(framed)));
-                let bottom_limit = rect
-                    .y
-                    .saturating_add(rect.height.saturating_sub(u16::from(framed)));
-                if cursor_x < right_limit && cursor_y < bottom_limit {
-                    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
-                }
+        if is_active && let Some(cursor) = pane.cursor {
+            let offset = u16::from(framed);
+            let cursor_x = rect
+                .x
+                .saturating_add(offset)
+                .saturating_add(cursor.col.min(usize::from(pane.cols.saturating_sub(1))) as u16);
+            let cursor_y = rect
+                .y
+                .saturating_add(offset)
+                .saturating_add(cursor.row.min(usize::from(pane.rows.saturating_sub(1))) as u16);
+            let right_limit = rect
+                .x
+                .saturating_add(rect.width.saturating_sub(u16::from(framed)));
+            let bottom_limit = rect
+                .y
+                .saturating_add(rect.height.saturating_sub(u16::from(framed)));
+            if cursor_x < right_limit && cursor_y < bottom_limit {
+                frame.set_cursor_position(Position::new(cursor_x, cursor_y));
             }
         }
     }
@@ -108,11 +106,11 @@ pub fn compute_pane_rects(
             let mut x = area.x;
             let mut remaining = area.width;
             let mut remaining_weight = weights.iter().sum::<u16>();
-            for index in 0..pane_count {
+            for (index, weight) in weights.iter().copied().enumerate() {
                 let width = if index + 1 == pane_count {
                     area.x + area.width - x
                 } else {
-                    weighted_span(remaining, weights[index], remaining_weight)
+                    weighted_span(remaining, weight, remaining_weight)
                 };
                 rects.push(Rect {
                     x,
@@ -122,18 +120,18 @@ pub fn compute_pane_rects(
                 });
                 x = x.saturating_add(width);
                 remaining = remaining.saturating_sub(width);
-                remaining_weight = remaining_weight.saturating_sub(weights[index]);
+                remaining_weight = remaining_weight.saturating_sub(weight);
             }
         }
         SplitAxis::Vertical => {
             let mut y = area.y;
             let mut remaining = area.height;
             let mut remaining_weight = weights.iter().sum::<u16>();
-            for index in 0..pane_count {
+            for (index, weight) in weights.iter().copied().enumerate() {
                 let height = if index + 1 == pane_count {
                     area.y + area.height - y
                 } else {
-                    weighted_span(remaining, weights[index], remaining_weight)
+                    weighted_span(remaining, weight, remaining_weight)
                 };
                 rects.push(Rect {
                     x: area.x,
@@ -143,7 +141,7 @@ pub fn compute_pane_rects(
                 });
                 y = y.saturating_add(height);
                 remaining = remaining.saturating_sub(height);
-                remaining_weight = remaining_weight.saturating_sub(weights[index]);
+                remaining_weight = remaining_weight.saturating_sub(weight);
             }
         }
     }

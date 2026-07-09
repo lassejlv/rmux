@@ -1,8 +1,8 @@
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::net::UnixStream,
-    path::PathBuf,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -47,13 +47,13 @@ pub fn list_session_names() -> Result<Vec<String>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("sock") {
-            if let Some(name) = path.file_stem().and_then(|name| name.to_str()) {
-                if UnixStream::connect(&path).is_ok() {
-                    names.push(name.to_string());
-                } else {
-                    let _ = fs::remove_file(path);
-                }
+        if path.extension().and_then(|ext| ext.to_str()) == Some("sock")
+            && let Some(name) = path.file_stem().and_then(|name| name.to_str())
+        {
+            if UnixStream::connect(&path).is_ok() {
+                names.push(name.to_string());
+            } else {
+                let _ = fs::remove_file(path);
             }
         }
     }
@@ -69,6 +69,15 @@ pub fn prepare_socket_path(session: &str) -> Result<PathBuf> {
     let socket = socket_path(session);
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent).context("create rmux socket dir")?;
+        let metadata = fs::symlink_metadata(parent).context("inspect rmux socket dir")?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "rmux socket path is not a secure directory: {}",
+                parent.display()
+            ));
+        }
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .context("secure rmux socket dir")?;
     }
     if socket.exists() {
         if UnixStream::connect(&socket).is_ok() {
@@ -77,6 +86,11 @@ pub fn prepare_socket_path(session: &str) -> Result<PathBuf> {
         fs::remove_file(&socket).context("remove stale rmux socket")?;
     }
     Ok(socket)
+}
+
+pub fn secure_socket_path(socket: &Path) -> Result<()> {
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o600))
+        .context("secure rmux server socket")
 }
 
 pub fn socket_dir() -> PathBuf {
@@ -150,7 +164,21 @@ mod tests {
     fn prepare_socket_path_refuses_live_session() {
         let session = format!("rmux-test-{}", std::process::id());
         let socket = prepare_socket_path(&session).expect("prepare first socket");
+        let dir_mode = fs::metadata(socket.parent().expect("socket parent"))
+            .expect("socket dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
         let listener = UnixListener::bind(&socket).expect("bind live test socket");
+        secure_socket_path(&socket).expect("secure live test socket");
+        let socket_mode = fs::metadata(&socket)
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(socket_mode, 0o600);
 
         let error = prepare_socket_path(&session).expect_err("live socket should be refused");
         assert!(error.to_string().contains("already running"));

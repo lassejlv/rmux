@@ -152,7 +152,9 @@ server session.
 
 ```sh
 cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
 cargo test
 cargo run -- --help
+node --test npm/install.test.js
 ./scripts/smoke-detach-attach.sh
 ```

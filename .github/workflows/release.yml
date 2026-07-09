@@ -6,12 +6,38 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run Rust tests
+        run: cargo test --locked
+      - name: Check CLI startup
+        run: cargo run --locked -- --help
+      - name: Run detach/attach smoke test
+        run: ./scripts/smoke-detach-attach.sh
+      - name: Test npm installer checksum verification
+        run: node --test npm/install.test.js
+
   build:
     name: Build ${{ matrix.asset }}
+    needs: validate
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       matrix:
         include:
@@ -36,10 +62,14 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/rmux ${{ matrix.asset }}
+      - name: Generate checksum
+        run: shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset }}
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
 
   publish-npm:
     name: Publish npm package
