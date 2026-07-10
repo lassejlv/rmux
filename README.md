@@ -146,6 +146,8 @@ server session.
 - `Alt-1` through `Alt-9` selects a window/tab (works in most terminals).
 - `Ctrl-w` closes the active pane, except the last pane.
 - Click inside a pane to select it.
+- Drag across terminal text to select and copy it to the system clipboard.
+- Use the mouse wheel to move through scrollback. Hold `Shift` while dragging or scrolling to override an application's mouse capture.
 - `Ctrl-b Ctrl-b` sends a literal prefix key to the pane.
 - `set-option prefix C-a` changes the prefix key for that session.
 - `bind-key v split-window --horizontal` binds a custom prefix action.

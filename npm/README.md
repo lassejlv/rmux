@@ -65,7 +65,9 @@ rmux capture-pane -t worker
 - `Ctrl-b q` quits.
 
 Direct shortcuts such as `Ctrl-d`, `Ctrl-Shift-d`, `Ctrl-t`, and `Ctrl-w` are
-also supported. Run `rmux --help` for the complete command list.
+also supported. Mouse dragging selects and copies terminal text, and the wheel
+scrolls through history; hold `Shift` to override an application's mouse
+capture. Run `rmux --help` for the complete command list.
 
 ## Supported platforms
 

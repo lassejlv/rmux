@@ -157,7 +157,7 @@ pub enum RmuxCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerResponse {
-    View(SessionView),
+    View(Box<SessionView>),
     Noop,
     Detached,
     Shutdown,
@@ -167,7 +167,7 @@ pub enum ServerResponse {
 impl ServerResponse {
     pub fn into_view(self) -> Result<SessionView> {
         match self {
-            Self::View(view) => Ok(view),
+            Self::View(view) => Ok(*view),
             Self::Noop => Err(anyhow!("request did not produce a view")),
             Self::Detached => Err(anyhow!("session detached")),
             Self::Shutdown => Err(anyhow!("session shut down")),
@@ -207,6 +207,8 @@ pub struct SessionView {
     pub pane_weights: Vec<u16>,
     pub prefix: bool,
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +248,12 @@ pub struct PaneView {
     pub cells: Vec<PaneCell>,
     #[serde(default)]
     pub cursor: Option<CursorView>,
+    #[serde(default)]
+    pub scroll_offset: usize,
+    #[serde(default)]
+    pub history_size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionView>,
     pub lines: Vec<String>,
 }
 
@@ -270,6 +278,12 @@ pub struct PaneCell {
 pub struct CursorView {
     pub col: usize,
     pub row: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionView {
+    pub start: CursorView,
+    pub end: CursorView,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

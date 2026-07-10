@@ -8,12 +8,14 @@ use termy_core::{
     TerminalMousePosition, TerminalReplyHost, TerminalRuntimeConfig, TerminalSize, TermyFrame,
     encode_mouse_report, load_config_from_default_path, measure_cell_from_config,
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     STATUS_ROWS,
     protocol::{
-        BoundCommand, KeyBindingView, PaneView, ResizeDirection, SessionView, SplitAxis,
-        SwapDirection, TtySize, WindowTabView, WireMouse, WireMouseButton, WireMouseKind,
+        BoundCommand, KeyBindingView, PaneView, ResizeDirection, SelectionView, SessionView,
+        SplitAxis, SwapDirection, TtySize, WindowTabView, WireMouse, WireMouseButton,
+        WireMouseKind,
     },
     render::frame_cells_and_text_lines,
 };
@@ -25,6 +27,7 @@ pub struct RawPane {
     rows: u16,
     max_width: usize,
     frame: TermyFrame,
+    selection: Option<SelectionView>,
 }
 
 pub struct RawView {
@@ -40,12 +43,15 @@ pub struct RawView {
     pane_weights: Vec<u16>,
     prefix: bool,
     message: Option<String>,
+    clipboard_text: Option<String>,
 }
 
 pub fn build_session_view(raw: RawView) -> SessionView {
     let mut panes = Vec::with_capacity(raw.panes.len());
     for rp in raw.panes {
         let (cells, lines) = frame_cells_and_text_lines(&rp.frame, rp.max_width);
+        let scroll_offset = rp.frame.display_offset;
+        let history_size = rp.frame.history_size;
         let cursor = rp.frame.cursor.map(|cursor| crate::protocol::CursorView {
             col: cursor.col,
             row: cursor.row,
@@ -60,6 +66,9 @@ pub fn build_session_view(raw: RawView) -> SessionView {
             rows: rp.rows,
             cells,
             cursor,
+            scroll_offset,
+            history_size,
+            selection: rp.selection,
             lines,
         });
     }
@@ -77,6 +86,7 @@ pub fn build_session_view(raw: RawView) -> SessionView {
         pane_weights: raw.pane_weights,
         prefix: raw.prefix,
         message: raw.message,
+        clipboard_text: raw.clipboard_text,
     }
 }
 
@@ -88,8 +98,109 @@ const EVEN_PANE_WEIGHT: u16 = 100;
 const DEFAULT_PREFIX_KEY: u8 = 0x02;
 const MAX_PANES_PER_WINDOW: usize = 64;
 const MAX_WINDOWS_PER_SESSION: usize = 64;
+const MOUSE_MODIFIER_SHIFT: u8 = 1;
+const MOUSE_SCROLL_LINES: i32 = 3;
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewportCell {
+    col: usize,
+    row: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectionState {
+    window: usize,
+    pane: usize,
+    anchor: ViewportCell,
+    head: ViewportCell,
+    dragging: bool,
+}
+
+impl SelectionState {
+    fn view(self) -> SelectionView {
+        let (start, end) = ordered_selection(self.anchor, self.head);
+        SelectionView {
+            start: crate::protocol::CursorView {
+                col: start.col,
+                row: start.row,
+            },
+            end: crate::protocol::CursorView {
+                col: end.col,
+                row: end.row,
+            },
+        }
+    }
+}
+
+fn ordered_selection(first: ViewportCell, second: ViewportCell) -> (ViewportCell, ViewportCell) {
+    if (second.row, second.col) < (first.row, first.col) {
+        (second, first)
+    } else {
+        (first, second)
+    }
+}
+
+fn selected_text_from_frame(
+    frame: &TermyFrame,
+    first: ViewportCell,
+    second: ViewportCell,
+) -> Option<String> {
+    let cols = usize::from(frame.cols);
+    let rows = usize::from(frame.rows);
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+
+    let mut grid = vec![Some(' '); rows.saturating_mul(cols)];
+    for cell in &frame.cells {
+        if !cell.render_text || cell.row >= rows || cell.col >= cols {
+            continue;
+        }
+        let ch = if cell.char.is_control() {
+            ' '
+        } else {
+            cell.char
+        };
+        grid[cell.row * cols + cell.col] = Some(ch);
+        let width = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+        for offset in 1..width {
+            if cell.col + offset < cols {
+                grid[cell.row * cols + cell.col + offset] = None;
+            }
+        }
+    }
+
+    let clamp = |position: ViewportCell| ViewportCell {
+        col: position.col.min(cols - 1),
+        row: position.row.min(rows - 1),
+    };
+    let mut first = clamp(first);
+    let mut second = clamp(second);
+    if first.col > 0 && grid[first.row * cols + first.col].is_none() {
+        first.col -= 1;
+    }
+    if second.col > 0 && grid[second.row * cols + second.col].is_none() {
+        second.col -= 1;
+    }
+    let (start, end) = ordered_selection(first, second);
+
+    let mut lines = Vec::with_capacity(end.row - start.row + 1);
+    for row in start.row..=end.row {
+        let col_start = if row == start.row { start.col } else { 0 };
+        let col_end = if row == end.row { end.col } else { cols - 1 };
+        let rendered = grid[row * cols + col_start..=row * cols + col_end]
+            .iter()
+            .filter_map(|ch| *ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        lines.push(rendered);
+    }
+    let selected = lines.join("\n");
+    (!selected.is_empty()).then_some(selected)
+}
 
 fn sanitize_bracketed_paste_input(input: &[u8]) -> Option<Vec<u8>> {
     let mut sanitized = None;
@@ -239,6 +350,7 @@ impl Pane {
     }
 
     fn write(&self, bytes: &[u8]) {
+        self.terminal.scroll_to_bottom();
         self.terminal.write(bytes);
     }
 
@@ -1049,6 +1161,8 @@ pub struct Rmux {
     terminal_config: TerminalConfig,
     exit_reason: Option<ExitReason>,
     detach_generation: u64,
+    selection: Option<SelectionState>,
+    pending_clipboard_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1083,13 +1197,22 @@ impl Rmux {
             terminal_config,
             exit_reason: None,
             detach_generation: 0,
+            selection: None,
+            pending_clipboard_text: None,
         };
         app.message("split: ^D/^Shift-D  click pane  detach: d  quit: q");
         Ok(app)
     }
 
     pub fn resize(&mut self, tty_size: TtySize) {
+        if self.tty_size != tty_size {
+            self.selection = None;
+        }
         self.tty_size = tty_size;
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
     }
 
     #[cfg(test)]
@@ -1106,6 +1229,8 @@ impl Rmux {
         };
         let layouts = self.active_window().layout_rects(pane_area);
         let terminal_config = self.terminal_config.clone();
+        let active_window_index = self.session.active_window;
+        let selection_state = self.selection;
         let framed = layouts.len() > 1;
         let mut panes = Vec::with_capacity(layouts.len());
         for (index, rect) in layouts.into_iter().enumerate() {
@@ -1128,6 +1253,11 @@ impl Rmux {
                 rows: size.rows,
                 max_width,
                 frame,
+                selection: selection_state
+                    .filter(|selection| {
+                        selection.window == active_window_index && selection.pane == index
+                    })
+                    .map(SelectionState::view),
             });
         }
 
@@ -1161,6 +1291,7 @@ impl Rmux {
             pane_weights: self.active_window().pane_weights.clone(),
             prefix: self.prefix,
             message: self.messages.back().cloned(),
+            clipboard_text: self.pending_clipboard_text.take(),
         }
     }
 
@@ -1173,6 +1304,7 @@ impl Rmux {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        self.selection = None;
         if self.prefix {
             self.prefix = false;
             if key_matches_byte(key, self.session.prefix_key) {
@@ -1258,25 +1390,141 @@ impl Rmux {
         Ok(())
     }
 
-    pub fn write_active(&self, bytes: &[u8]) {
+    pub fn write_active(&mut self, bytes: &[u8]) {
+        self.selection = None;
         self.active_window().write_input(bytes);
     }
 
-    pub fn paste_active(&self, bytes: &[u8]) {
+    pub fn paste_active(&mut self, bytes: &[u8]) {
+        self.selection = None;
         self.active_window().paste_input(bytes);
     }
 
     pub fn handle_mouse(&mut self, mouse: WireMouse) -> bool {
-        if self.forward_mouse(mouse) {
+        let selection_dragging = self.selection.is_some_and(|selection| selection.dragging);
+        if !selection_dragging
+            && mouse.modifiers & MOUSE_MODIFIER_SHIFT == 0
+            && self.forward_mouse(mouse)
+        {
+            if matches!(mouse.kind, WireMouseKind::Down(WireMouseButton::Left)) {
+                self.selection = None;
+            }
             return true;
         }
-        if matches!(mouse.kind, WireMouseKind::Down(WireMouseButton::Left)) {
-            if mouse.row >= self.tty_size.rows.saturating_sub(STATUS_ROWS) {
-                return self.select_window_at_status(mouse.col);
+        match mouse.kind {
+            WireMouseKind::Down(WireMouseButton::Left) => {
+                self.begin_selection(mouse.col, mouse.row)
             }
-            return self.select_pane_at(mouse.col, mouse.row);
+            WireMouseKind::Drag(WireMouseButton::Left) => {
+                self.update_selection(mouse.col, mouse.row)
+            }
+            WireMouseKind::Up(WireMouseButton::Left) => self.finish_selection(mouse.col, mouse.row),
+            WireMouseKind::ScrollUp => {
+                self.scroll_pane_at(mouse.col, mouse.row, MOUSE_SCROLL_LINES)
+            }
+            WireMouseKind::ScrollDown => {
+                self.scroll_pane_at(mouse.col, mouse.row, -MOUSE_SCROLL_LINES)
+            }
+            _ => false,
         }
-        false
+    }
+
+    fn begin_selection(&mut self, col: u16, row: u16) -> bool {
+        self.pending_clipboard_text = None;
+        if row >= self.tty_size.rows.saturating_sub(STATUS_ROWS) {
+            let cleared = self.selection.take().is_some();
+            return self.select_window_at_status(col) || cleared;
+        }
+        let Some((pane, position)) = self.mouse_target(col, row) else {
+            return false;
+        };
+        self.active_window_mut().select_pane(pane);
+        let cell = ViewportCell {
+            col: position.col,
+            row: position.row,
+        };
+        self.selection = Some(SelectionState {
+            window: self.session.active_window,
+            pane,
+            anchor: cell,
+            head: cell,
+            dragging: true,
+        });
+        true
+    }
+
+    fn update_selection(&mut self, col: u16, row: u16) -> bool {
+        let Some((pane, position)) = self.mouse_target(col, row) else {
+            return false;
+        };
+        let Some(selection) = self.selection.as_mut() else {
+            return false;
+        };
+        if !selection.dragging
+            || selection.window != self.session.active_window
+            || selection.pane != pane
+        {
+            return false;
+        }
+        let head = ViewportCell {
+            col: position.col,
+            row: position.row,
+        };
+        if selection.head == head {
+            return false;
+        }
+        selection.head = head;
+        true
+    }
+
+    fn finish_selection(&mut self, col: u16, row: u16) -> bool {
+        let target = self.mouse_target(col, row);
+        let Some(mut selection) = self.selection else {
+            return false;
+        };
+        if !selection.dragging {
+            return false;
+        }
+        if let Some((pane, position)) = target
+            && pane == selection.pane
+            && selection.window == self.session.active_window
+        {
+            selection.head = ViewportCell {
+                col: position.col,
+                row: position.row,
+            };
+        }
+        if selection.anchor == selection.head {
+            self.selection = None;
+            return true;
+        }
+        selection.dragging = false;
+        self.pending_clipboard_text = self
+            .session
+            .windows
+            .get(selection.window)
+            .and_then(|window| window.panes.get(selection.pane))
+            .and_then(|pane| {
+                selected_text_from_frame(
+                    &pane.terminal.snapshot(),
+                    selection.anchor,
+                    selection.head,
+                )
+            });
+        self.selection = Some(selection);
+        true
+    }
+
+    fn scroll_pane_at(&mut self, col: u16, row: u16, delta_lines: i32) -> bool {
+        let Some((pane, _)) = self.mouse_target(col, row) else {
+            return false;
+        };
+        let focus_changed = self.active_window_mut().select_pane(pane);
+        let scrolled = self.active_window().panes[pane]
+            .terminal
+            .scroll_display(delta_lines);
+        let selection_cleared = self.selection.take().is_some();
+        focus_changed || scrolled || selection_cleared
     }
 
     /// Map a click on the status bar to the window tab under the cursor.
@@ -1294,7 +1542,7 @@ impl Rmux {
         false
     }
 
-    pub fn send_prefix(&self) {
+    pub fn send_prefix(&mut self) {
         self.write_active(&[self.session.prefix_key]);
     }
 
@@ -1326,6 +1574,7 @@ impl Rmux {
         self.active_window_mut().select_pane(index)
     }
 
+    #[cfg(test)]
     pub fn select_pane_at(&mut self, col: u16, row: u16) -> bool {
         if row >= self.tty_size.rows.saturating_sub(STATUS_ROWS) {
             return false;
@@ -1916,6 +2165,36 @@ fn format_key_byte(byte: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use termy_core::{TermyCell, TermyColor};
+
+    fn test_frame(cols: u16, rows: u16, cells: &[(usize, usize, char)]) -> TermyFrame {
+        let color = TermyColor {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        TermyFrame {
+            cols,
+            rows,
+            cells: cells
+                .iter()
+                .map(|&(col, row, char)| TermyCell {
+                    col,
+                    row,
+                    char,
+                    fg: color,
+                    bg: color,
+                    uses_terminal_default_bg: true,
+                    bold: false,
+                    render_text: true,
+                })
+                .collect(),
+            cursor: None,
+            display_offset: 0,
+            history_size: 0,
+        }
+    }
 
     #[test]
     fn bracketed_paste_is_framed_once() {
@@ -1930,6 +2209,51 @@ mod tests {
         assert_eq!(
             framed_bracketed_paste_input(b"before\x1b[201~middle\x1b[200~after"),
             b"\x1b[200~beforemiddleafter\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn selection_extracts_visible_multiline_text() {
+        let frame = test_frame(
+            6,
+            2,
+            &[
+                (0, 0, 'h'),
+                (1, 0, 'e'),
+                (2, 0, 'l'),
+                (3, 0, 'l'),
+                (4, 0, 'o'),
+                (0, 1, 'w'),
+                (1, 1, 'o'),
+                (2, 1, 'r'),
+                (3, 1, 'l'),
+                (4, 1, 'd'),
+            ],
+        );
+
+        assert_eq!(
+            selected_text_from_frame(
+                &frame,
+                ViewportCell { col: 1, row: 0 },
+                ViewportCell { col: 2, row: 1 },
+            )
+            .as_deref(),
+            Some("ello\nwor")
+        );
+    }
+
+    #[test]
+    fn selection_starting_on_wide_character_spacer_includes_character() {
+        let frame = test_frame(4, 1, &[(0, 0, 'a'), (1, 0, '桌'), (3, 0, 'b')]);
+
+        assert_eq!(
+            selected_text_from_frame(
+                &frame,
+                ViewportCell { col: 2, row: 0 },
+                ViewportCell { col: 2, row: 0 },
+            )
+            .as_deref(),
+            Some("桌")
         );
     }
 }

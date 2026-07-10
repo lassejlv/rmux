@@ -1998,13 +1998,16 @@ fn handle_client(
                     app.drain_events();
                     pending_after_drain(&mut app)
                 }
-                ClientRequest::Command(command) => match apply_rmux_command(&mut app, command) {
-                    Ok(()) => {
-                        app.drain_events();
-                        pending_after_drain(&mut app)
+                ClientRequest::Command(command) => {
+                    app.clear_selection();
+                    match apply_rmux_command(&mut app, command) {
+                        Ok(()) => {
+                            app.drain_events();
+                            pending_after_drain(&mut app)
+                        }
+                        Err(err) => LockedResult::Response(ServerResponse::Error(err.to_string())),
                     }
-                    Err(err) => LockedResult::Response(ServerResponse::Error(err.to_string())),
-                },
+                }
                 ClientRequest::Shutdown => LockedResult::Response(ServerResponse::Shutdown),
             };
             if app.detach_generation() != seen_detach_generation {
@@ -2017,7 +2020,7 @@ fn handle_client(
 
         let response = match pending {
             LockedResult::Response(r) => r,
-            LockedResult::View(raw) => ServerResponse::View(build_session_view(raw)),
+            LockedResult::View(raw) => ServerResponse::View(Box::new(build_session_view(*raw))),
         };
 
         if write_json(stream, &response).is_err() {
@@ -2038,14 +2041,14 @@ fn handle_client(
 
 enum LockedResult {
     Response(ServerResponse),
-    View(RawView),
+    View(Box<RawView>),
 }
 
 fn pending_after_drain(app: &mut Rmux) -> LockedResult {
     match app.take_exit_reason() {
         Some(ExitReason::Detach) => LockedResult::Response(ServerResponse::Detached),
         Some(ExitReason::Quit) => LockedResult::Response(ServerResponse::Shutdown),
-        None => LockedResult::View(app.collect_raw_view()),
+        None => LockedResult::View(Box::new(app.collect_raw_view())),
     }
 }
 
@@ -2308,10 +2311,48 @@ fn draw_session_view(
     terminal: &mut RatTerminal<CrosstermBackend<io::Stdout>>,
     view: &protocol::SessionView,
 ) -> Result<()> {
+    if let Some(text) = view.clipboard_text.as_deref() {
+        copy_to_system_clipboard(text)?;
+    }
     match terminal.draw(|frame| draw_view(frame, view)) {
         Ok(_) => Ok(()),
         Err(err) => Err(err).context("draw rmux terminal"),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn copy_to_system_clipboard(text: &str) -> Result<()> {
+    let mut child = ProcessCommand::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("start pbcopy")?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("pbcopy stdin unavailable"))?
+        .write_all(text.as_bytes())
+        .context("write selection to pbcopy")?;
+    let status = child.wait().context("wait for pbcopy")?;
+    if !status.success() {
+        return Err(anyhow!("pbcopy exited with {status}"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_to_system_clipboard(text: &str) -> Result<()> {
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(osc52_clipboard_sequence(text).as_bytes())
+        .context("write OSC 52 clipboard sequence")?;
+    stdout.flush().context("flush OSC 52 clipboard sequence")
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn osc52_clipboard_sequence(text: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    format!("\x1b]52;c;{}\x07", STANDARD.encode(text.as_bytes()))
 }
 
 fn is_terminal_output_closed(err: &io::Error) -> bool {
@@ -2358,6 +2399,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+
+    #[test]
+    fn osc52_clipboard_payload_is_base64_encoded() {
+        assert_eq!(osc52_clipboard_sequence("hello"), "\x1b]52;c;aGVsbG8=\x07");
     }
 
     #[test]
@@ -2938,6 +2984,113 @@ mod tests {
     }
 
     #[test]
+    fn mouse_drag_selects_and_copies_visible_text() {
+        let terminal_config = TerminalConfig::load();
+        let mut app = Rmux::new(
+            TtySize { cols: 80, rows: 24 },
+            terminal_config,
+            "test",
+            Some("printf 'hello world'; sleep 2"),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            app.drain_events();
+            if app.session_view().panes[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("hello world"))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(app.handle_mouse(WireMouse {
+            col: 0,
+            row: 0,
+            kind: WireMouseKind::Down(WireMouseButton::Left),
+            modifiers: 0,
+        }));
+        assert!(app.handle_mouse(WireMouse {
+            col: 4,
+            row: 0,
+            kind: WireMouseKind::Drag(WireMouseButton::Left),
+            modifiers: 0,
+        }));
+        assert!(app.handle_mouse(WireMouse {
+            col: 4,
+            row: 0,
+            kind: WireMouseKind::Up(WireMouseButton::Left),
+            modifiers: 0,
+        }));
+
+        let view = app.session_view();
+        let selection = view.panes[0].selection.expect("selection should persist");
+        assert_eq!(selection.start, protocol::CursorView { col: 0, row: 0 });
+        assert_eq!(selection.end, protocol::CursorView { col: 4, row: 0 });
+        assert_eq!(view.clipboard_text.as_deref(), Some("hello"));
+        assert!(app.session_view().clipboard_text.is_none());
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_terminal_history() {
+        let terminal_config = TerminalConfig::load();
+        let mut app = Rmux::new(
+            TtySize { cols: 80, rows: 24 },
+            terminal_config,
+            "test",
+            Some("i=1; while [ \"$i\" -le 80 ]; do echo \"line-$i\"; i=$((i+1)); done; sleep 2"),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let bottom_view = loop {
+            app.drain_events();
+            let view = app.session_view();
+            if view.panes[0].history_size > 0 {
+                break view;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal did not build scrollback"
+            );
+            thread::sleep(Duration::from_millis(25));
+        };
+        assert_eq!(bottom_view.panes[0].scroll_offset, 0);
+
+        assert!(app.handle_mouse(WireMouse {
+            col: 2,
+            row: 2,
+            kind: WireMouseKind::ScrollUp,
+            modifiers: 0,
+        }));
+        let scrolled_up = app.session_view();
+        assert!(scrolled_up.panes[0].scroll_offset > 0);
+        assert_ne!(scrolled_up.panes[0].lines, bottom_view.panes[0].lines);
+
+        let offset = scrolled_up.panes[0].scroll_offset;
+        assert!(app.handle_mouse(WireMouse {
+            col: 2,
+            row: 2,
+            kind: WireMouseKind::ScrollDown,
+            modifiers: 0,
+        }));
+        assert!(app.session_view().panes[0].scroll_offset < offset);
+
+        assert!(app.handle_mouse(WireMouse {
+            col: 2,
+            row: 2,
+            kind: WireMouseKind::ScrollUp,
+            modifiers: 0,
+        }));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.session_view().panes[0].scroll_offset, 0);
+    }
+
+    #[test]
     fn paste_honors_child_bracketed_paste_mode() {
         let terminal_config = TerminalConfig::load();
         let mut app = Rmux::new(
@@ -3052,12 +3205,33 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
 
+        assert!(app.handle_mouse(WireMouse {
+            col: 4,
+            row: 2,
+            kind: WireMouseKind::Down(WireMouseButton::Left),
+            modifiers: 1,
+        }));
+        assert!(app.handle_mouse(WireMouse {
+            col: 6,
+            row: 2,
+            kind: WireMouseKind::Drag(WireMouseButton::Left),
+            modifiers: 1,
+        }));
+        assert!(app.handle_mouse(WireMouse {
+            col: 6,
+            row: 2,
+            kind: WireMouseKind::Up(WireMouseButton::Left),
+            modifiers: 0,
+        }));
+        assert!(app.session_view().panes[0].selection.is_some());
+
         app.handle_mouse(WireMouse {
             col: 4,
             row: 2,
             kind: WireMouseKind::Down(WireMouseButton::Left),
             modifiers: 0,
         });
+        assert!(app.session_view().panes[0].selection.is_none());
 
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
@@ -3337,6 +3511,9 @@ mod tests {
                 rows: 24,
                 cells: Vec::new(),
                 cursor: None,
+                scroll_offset: 0,
+                history_size: 0,
+                selection: None,
                 lines: Vec::new(),
             }],
             active_pane: 0,
@@ -3344,6 +3521,7 @@ mod tests {
             pane_weights: vec![125],
             prefix: false,
             message: None,
+            clipboard_text: None,
         };
 
         assert_eq!(

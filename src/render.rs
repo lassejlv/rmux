@@ -284,7 +284,7 @@ fn cell_color(color: TermyColor) -> CellColor {
 }
 
 fn pane_terminal_lines(pane: &PaneView) -> Vec<Line<'static>> {
-    if pane.cells.is_empty() {
+    if pane.cols == 0 || pane.rows == 0 || (pane.cells.is_empty() && pane.selection.is_none()) {
         return pane
             .lines
             .iter()
@@ -314,7 +314,8 @@ fn pane_terminal_lines(pane: &PaneView) -> Vec<Line<'static>> {
                     continue;
                 }
                 let cell = grid[row * cols + col];
-                let style = cell.map_or(CellStyle::default(), CellStyle::from);
+                let mut style = cell.map_or(CellStyle::default(), CellStyle::from);
+                style.selected = selection_contains(pane, col, row);
                 let ch = cell.map_or(' ', |cell| cell.ch);
                 if current_style != Some(style) {
                     flush_span(&mut spans, &mut current_text, current_style);
@@ -330,6 +331,14 @@ fn pane_terminal_lines(pane: &PaneView) -> Vec<Line<'static>> {
         .collect()
 }
 
+fn selection_contains(pane: &PaneView, col: usize, row: usize) -> bool {
+    let Some(selection) = pane.selection else {
+        return false;
+    };
+    (row, col) >= (selection.start.row, selection.start.col)
+        && (row, col) <= (selection.end.row, selection.end.col)
+}
+
 fn flush_span(spans: &mut Vec<Span<'static>>, text: &mut String, style: Option<CellStyle>) {
     if text.is_empty() {
         return;
@@ -343,6 +352,7 @@ struct CellStyle {
     fg: Option<CellColor>,
     bg: Option<CellColor>,
     bold: bool,
+    selected: bool,
 }
 
 impl From<&PaneCell> for CellStyle {
@@ -351,6 +361,7 @@ impl From<&PaneCell> for CellStyle {
             fg: Some(cell.fg),
             bg: Some(cell.bg),
             bold: cell.bold,
+            selected: false,
         }
     }
 }
@@ -367,6 +378,9 @@ impl CellStyle {
         if self.bold {
             style = style.add_modifier(Modifier::BOLD);
         }
+        if self.selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
         style
     }
 }
@@ -374,7 +388,7 @@ impl CellStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::CursorView;
+    use crate::protocol::{CursorView, SelectionView};
     use termy_core::{TermyCell, TermyColor, TermyFrame};
 
     #[test]
@@ -443,6 +457,12 @@ mod tests {
                 bold: true,
             }],
             cursor: Some(CursorView { col: 0, row: 0 }),
+            scroll_offset: 0,
+            history_size: 0,
+            selection: Some(SelectionView {
+                start: CursorView { col: 0, row: 0 },
+                end: CursorView { col: 0, row: 0 },
+            }),
             lines: vec!["fallback".to_string()],
         };
 
@@ -456,6 +476,12 @@ mod tests {
                 .style
                 .add_modifier
                 .contains(Modifier::BOLD)
+        );
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
         );
     }
 }
