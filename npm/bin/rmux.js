@@ -13,7 +13,13 @@ const result = spawnSync(binary, process.argv.slice(2), {
 
 if (result.error) {
   if (result.error.code === "ENOENT") {
-    console.error("rmux binary is missing. Reinstall the package: npm install -g @cookedoss/rmux");
+    console.error(
+      [
+        "rmux native binary is missing because its install script did not run.",
+        "Bun: bun pm -g trust @cookedoss/rmux",
+        "npm: npm install -g @cookedoss/rmux",
+      ].join("\n"),
+    );
   } else {
     console.error(`rmux failed to start: ${result.error.message}`);
   }

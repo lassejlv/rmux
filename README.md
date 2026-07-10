@@ -15,7 +15,21 @@ Termy uses.
 
 ## Install
 
-With npm (downloads a prebuilt binary for macOS/Linux from GitHub Releases):
+With Bun (downloads and verifies a prebuilt binary for macOS/Linux):
+
+```sh
+bun install -g --trust @cookedoss/rmux
+rmux
+```
+
+The `--trust` flag allows rmux's checksum-verifying installer to run. If Bun
+already installed rmux but blocked its postinstall script, run:
+
+```sh
+bun pm -g trust @cookedoss/rmux
+```
+
+With npm:
 
 ```sh
 npm install -g @cookedoss/rmux

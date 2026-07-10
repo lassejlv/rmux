@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{ClientRequest, ServerResponse};
 
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 pub struct ServerClient {
     stream: UnixStream,
 }
@@ -100,6 +102,9 @@ pub fn socket_dir() -> PathBuf {
 
 pub fn write_json<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value).context("encode rmux message")?;
+    if bytes.len() > MAX_MESSAGE_SIZE {
+        return Err(anyhow!("rmux message too large: {} bytes", bytes.len()));
+    }
     let len: u32 = bytes
         .len()
         .try_into()
@@ -114,7 +119,6 @@ pub fn write_json<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()
 }
 
 pub fn read_json<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
-    const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
     let mut len = [0; 4];
     stream
         .read_exact(&mut len)
@@ -151,7 +155,7 @@ pub fn sanitized_session_name(session: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     #[test]
     fn sanitizes_session_names_for_socket_files() {
@@ -185,5 +189,15 @@ mod tests {
 
         drop(listener);
         let _ = fs::remove_file(socket);
+    }
+
+    #[test]
+    fn write_rejects_messages_over_the_read_limit() {
+        let (mut writer, _reader) = UnixStream::pair().unwrap();
+        let oversized = "x".repeat(MAX_MESSAGE_SIZE);
+
+        let error = write_json(&mut writer, &oversized).unwrap_err();
+
+        assert!(error.to_string().contains("rmux message too large"));
     }
 }

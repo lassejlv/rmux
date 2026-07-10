@@ -18,7 +18,10 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEvent},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyEvent,
+    },
     execute,
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -957,6 +960,31 @@ fn request_with_reconnect(
     }
 }
 
+fn request_paste_with_fallback(
+    client: &mut ServerClient,
+    session: &str,
+    text: String,
+    paste_request_supported: &mut bool,
+) -> Result<ServerResponse> {
+    if *paste_request_supported {
+        match request_with_reconnect(client, session, ClientRequest::Paste(text.clone())) {
+            Ok(response) => return Ok(response),
+            Err(err) if is_socket_closed(&err) => {
+                // A stale connection gets one fresh Paste retry above. If both attempts
+                // close, the server predates the Paste variant; reconnect once more and
+                // keep later pastes batched through its legacy raw Write path.
+                thread::sleep(Duration::from_millis(50));
+                *client = connect_session(session)?;
+                client.set_read_timeout(Some(Duration::from_secs(CLIENT_READ_TIMEOUT_SECS)))?;
+                *paste_request_supported = false;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    request_with_reconnect(client, session, ClientRequest::Write(text.into_bytes()))
+}
+
 fn run(options: LaunchOptions) -> Result<()> {
     let mut client = match connect_session(&options.session) {
         Ok(client) => client,
@@ -976,45 +1004,66 @@ fn run(options: LaunchOptions) -> Result<()> {
     let mut terminal = RatTerminal::new(backend)?;
     let tick_rate = Duration::from_millis(options.tick_ms);
 
-    loop {
-        let size = available_terminal_size()?;
-        let view =
-            request_with_reconnect(&mut client, &options.session, ClientRequest::Resize(size))?
-                .into_view()?;
-        draw_session_view(&mut terminal, &view)?;
+    let size = available_terminal_size()?;
+    let view = request_with_reconnect(&mut client, &options.session, ClientRequest::Resize(size))?
+        .into_view()?;
+    draw_session_view(&mut terminal, &view)?;
+    let mut last_size = size;
+    let mut last_frame = Instant::now();
+    let mut paste_request_supported = true;
 
-        let started = Instant::now();
-        while started.elapsed() < tick_rate {
-            let timeout = tick_rate.saturating_sub(started.elapsed());
-            if !terminal_input_ready(timeout)? {
-                continue;
-            }
-            if let Some(event) = read_terminal_event()? {
-                let response = match event {
-                    Event::Key(key) => Some(request_with_reconnect(
-                        &mut client,
-                        &options.session,
-                        ClientRequest::Key(WireKey::from(key)),
-                    )?),
-                    Event::Mouse(mouse) => Some(request_with_reconnect(
-                        &mut client,
-                        &options.session,
-                        ClientRequest::Mouse(WireMouse::from(mouse)),
-                    )?),
-                    _ => None,
-                };
-                if let Some(response) = response {
-                    match response {
-                        ServerResponse::View(view) => {
-                            draw_session_view(&mut terminal, &view)?;
-                        }
-                        ServerResponse::Noop => {}
-                        ServerResponse::Detached | ServerResponse::Shutdown => return Ok(()),
-                        ServerResponse::Error(message) => return Err(anyhow!(message)),
-                    };
+    loop {
+        let mut skip_snapshot = false;
+        let timeout = tick_rate.min(tick_rate.saturating_sub(last_frame.elapsed()));
+        if terminal_input_ready(timeout)?
+            && let Some(event) = read_terminal_event()?
+        {
+            let request = match event {
+                Event::Resize(_, _) => {
+                    let latest_size = available_terminal_size()?;
+                    resize_request(latest_size, &mut last_size)
                 }
+                event => terminal_event_request(event),
+            };
+            if request.is_none() && last_frame.elapsed() < tick_rate {
+                skip_snapshot = true;
             }
-            break;
+            let request_is_paste = matches!(&request, Some(ClientRequest::Paste(_)));
+            let response = match request {
+                Some(ClientRequest::Paste(text)) => Some(request_paste_with_fallback(
+                    &mut client,
+                    &options.session,
+                    text,
+                    &mut paste_request_supported,
+                )?),
+                Some(request) => Some(request_with_reconnect(
+                    &mut client,
+                    &options.session,
+                    request,
+                )?),
+                None => None,
+            };
+            if let Some(response) = response {
+                match response {
+                    ServerResponse::View(view) => {
+                        draw_session_view(&mut terminal, &view)?;
+                        last_frame = Instant::now();
+                        skip_snapshot = true;
+                    }
+                    ServerResponse::Noop
+                        if !request_is_paste && last_frame.elapsed() < tick_rate =>
+                    {
+                        skip_snapshot = true;
+                    }
+                    ServerResponse::Noop => {}
+                    ServerResponse::Detached | ServerResponse::Shutdown => return Ok(()),
+                    ServerResponse::Error(message) => return Err(anyhow!(message)),
+                };
+            }
+        }
+
+        if skip_snapshot {
+            continue;
         }
 
         let response =
@@ -1022,6 +1071,7 @@ fn run(options: LaunchOptions) -> Result<()> {
         match response {
             ServerResponse::View(view) => {
                 draw_session_view(&mut terminal, &view)?;
+                last_frame = Instant::now();
             }
             ServerResponse::Noop => {}
             ServerResponse::Detached | ServerResponse::Shutdown => break,
@@ -1030,6 +1080,23 @@ fn run(options: LaunchOptions) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn terminal_event_request(event: Event) -> Option<ClientRequest> {
+    match event {
+        Event::Key(key) => Some(ClientRequest::Key(WireKey::from(key))),
+        Event::Paste(text) if !text.is_empty() => Some(ClientRequest::Paste(text)),
+        Event::Mouse(mouse) => Some(ClientRequest::Mouse(WireMouse::from(mouse))),
+        _ => None,
+    }
+}
+
+fn resize_request(latest_size: TtySize, last_size: &mut TtySize) -> Option<ClientRequest> {
+    if latest_size == *last_size {
+        return None;
+    }
+    *last_size = latest_size;
+    Some(ClientRequest::Resize(latest_size))
 }
 
 fn ensure_server(options: &LaunchOptions) -> Result<()> {
@@ -1909,6 +1976,11 @@ fn handle_client(
                     }
                     Err(err) => LockedResult::Response(ServerResponse::Error(err.to_string())),
                 },
+                ClientRequest::Paste(text) => {
+                    app.paste_active(text.as_bytes());
+                    app.drain_events();
+                    pending_without_view(&mut app)
+                }
                 ClientRequest::Mouse(mouse) => {
                     if app.handle_mouse(mouse) {
                         app.drain_events();
@@ -1974,6 +2046,14 @@ fn pending_after_drain(app: &mut Rmux) -> LockedResult {
         Some(ExitReason::Detach) => LockedResult::Response(ServerResponse::Detached),
         Some(ExitReason::Quit) => LockedResult::Response(ServerResponse::Shutdown),
         None => LockedResult::View(app.collect_raw_view()),
+    }
+}
+
+fn pending_without_view(app: &mut Rmux) -> LockedResult {
+    match app.take_exit_reason() {
+        Some(ExitReason::Detach) => LockedResult::Response(ServerResponse::Detached),
+        Some(ExitReason::Quit) => LockedResult::Response(ServerResponse::Shutdown),
+        None => LockedResult::Response(ServerResponse::Noop),
     }
 }
 
@@ -2191,9 +2271,20 @@ impl TerminalGuard {
         enable_raw_mode().with_context(
             || "enter raw terminal mode; rmux must be run from an interactive terminal",
         )?;
-        match execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture) {
+        match execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
             Ok(()) => Ok(Self),
             Err(err) => {
+                let _ = execute!(
+                    io::stdout(),
+                    DisableBracketedPaste,
+                    DisableMouseCapture,
+                    LeaveAlternateScreen
+                );
                 let _ = disable_raw_mode();
                 Err(err).context("enter alternate terminal screen")
             }
@@ -2204,7 +2295,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -2262,6 +2358,145 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+
+    #[test]
+    fn paste_event_becomes_one_bulk_request() {
+        let payload = "first line\nsecond line 🦀";
+        let request = terminal_event_request(Event::Paste(payload.to_string()));
+
+        assert!(
+            matches!(request, Some(ClientRequest::Paste(text)) if text == payload),
+            "a complete paste should stay in one request"
+        );
+    }
+
+    #[test]
+    fn paste_falls_back_to_bulk_write_for_older_servers() {
+        let session = format!(
+            "rmux-test-paste-fallback-{}-{}",
+            std::process::id(),
+            monotonic_test_id()
+        );
+        let socket = prepare_socket_path(&session).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        secure_socket_path(&socket).unwrap();
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut unsupported, _) = listener.accept().unwrap();
+                let request = read_json::<serde_json::Value>(&mut unsupported).unwrap();
+                assert_eq!(request, serde_json::json!({ "Paste": "first" }));
+            }
+
+            let (mut legacy, _) = listener.accept().unwrap();
+            for expected in [b"first".as_slice(), b"second".as_slice()] {
+                let request = read_json::<ClientRequest>(&mut legacy).unwrap();
+                assert!(
+                    matches!(request, ClientRequest::Write(bytes) if bytes == expected),
+                    "fallback should keep each paste in one legacy Write request"
+                );
+                write_json(&mut legacy, &ServerResponse::Noop).unwrap();
+            }
+            let _ = fs::remove_file(server_socket);
+        });
+
+        let mut client = connect_session(&session).unwrap();
+        let mut paste_request_supported = true;
+        assert!(matches!(
+            request_paste_with_fallback(
+                &mut client,
+                &session,
+                "first".to_string(),
+                &mut paste_request_supported,
+            )
+            .unwrap(),
+            ServerResponse::Noop
+        ));
+        assert!(!paste_request_supported);
+        assert!(matches!(
+            request_paste_with_fallback(
+                &mut client,
+                &session,
+                "second".to_string(),
+                &mut paste_request_supported,
+            )
+            .unwrap(),
+            ServerResponse::Noop
+        ));
+
+        server.join().unwrap();
+        let _ = fs::remove_file(socket);
+    }
+
+    #[test]
+    fn paste_keeps_new_protocol_after_a_stale_connection() {
+        let session = format!(
+            "rmux-test-paste-reconnect-{}-{}",
+            std::process::id(),
+            monotonic_test_id()
+        );
+        let socket = prepare_socket_path(&session).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        secure_socket_path(&socket).unwrap();
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            let (stale, _) = listener.accept().unwrap();
+            drop(stale);
+
+            let (mut fresh, _) = listener.accept().unwrap();
+            let request = read_json::<ClientRequest>(&mut fresh).unwrap();
+            assert!(matches!(request, ClientRequest::Paste(text) if text == "fresh"));
+            write_json(&mut fresh, &ServerResponse::Noop).unwrap();
+            let _ = fs::remove_file(server_socket);
+        });
+
+        let mut client = connect_session(&session).unwrap();
+        let mut paste_request_supported = true;
+        assert!(matches!(
+            request_paste_with_fallback(
+                &mut client,
+                &session,
+                "fresh".to_string(),
+                &mut paste_request_supported,
+            )
+            .unwrap(),
+            ServerResponse::Noop
+        ));
+        assert!(paste_request_supported);
+
+        server.join().unwrap();
+        let _ = fs::remove_file(socket);
+    }
+
+    #[test]
+    fn resize_requests_are_deduplicated() {
+        let mut last_size = TtySize { cols: 80, rows: 24 };
+        let request = resize_request(
+            TtySize {
+                cols: 120,
+                rows: 40,
+            },
+            &mut last_size,
+        );
+
+        assert!(matches!(
+            request,
+            Some(ClientRequest::Resize(TtySize {
+                cols: 120,
+                rows: 40
+            }))
+        ));
+        assert!(
+            resize_request(
+                TtySize {
+                    cols: 120,
+                    rows: 40,
+                },
+                &mut last_size,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2700,6 +2935,104 @@ mod tests {
             kind: WireMouseKind::Moved,
             modifiers: 0,
         }));
+    }
+
+    #[test]
+    fn paste_honors_child_bracketed_paste_mode() {
+        let terminal_config = TerminalConfig::load();
+        let mut app = Rmux::new(
+            TtySize { cols: 80, rows: 24 },
+            terminal_config,
+            "test",
+            Some("printf '\\033[?2004hPASTE_READY'; cat -v"),
+        )
+        .unwrap();
+
+        let ready_deadline = Instant::now() + Duration::from_secs(1);
+        let mut ready = false;
+        while Instant::now() < ready_deadline {
+            app.drain_events();
+            if app.session_view().panes[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("PASTE_READY"))
+            {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(ready, "child did not enable bracketed paste mode");
+
+        app.paste_active(b"left\x1b[201~middle\x1b[200~right");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            app.drain_events();
+            let view = app.session_view();
+            if view.panes[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("^[[200~leftmiddleright^[[201~"))
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        panic!("paste was not sent as one sanitized bracketed payload");
+    }
+
+    #[test]
+    fn paste_stays_raw_when_child_bracketed_paste_is_disabled() {
+        let terminal_config = TerminalConfig::load();
+        let mut app = Rmux::new(
+            TtySize { cols: 80, rows: 24 },
+            terminal_config,
+            "test",
+            Some("stty -echo; printf 'RAW_READY'; cat -v"),
+        )
+        .unwrap();
+
+        let ready_deadline = Instant::now() + Duration::from_secs(1);
+        let mut ready = false;
+        while Instant::now() < ready_deadline {
+            app.drain_events();
+            if app.session_view().panes[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("RAW_READY"))
+            {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(ready, "raw-paste child did not become ready");
+
+        app.paste_active(b"raw-paste\n");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            app.drain_events();
+            let view = app.session_view();
+            if view.panes[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("raw-paste"))
+            {
+                assert!(
+                    view.panes[0]
+                        .lines
+                        .iter()
+                        .all(|line| !line.contains("[200~") && !line.contains("[201~"))
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        panic!("raw paste did not reach the child");
     }
 
     #[test]

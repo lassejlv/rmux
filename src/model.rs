@@ -88,6 +88,50 @@ const EVEN_PANE_WEIGHT: u16 = 100;
 const DEFAULT_PREFIX_KEY: u8 = 0x02;
 const MAX_PANES_PER_WINDOW: usize = 64;
 const MAX_WINDOWS_PER_SESSION: usize = 64;
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+fn sanitize_bracketed_paste_input(input: &[u8]) -> Option<Vec<u8>> {
+    let mut sanitized = None;
+    let mut index = 0;
+    while index < input.len() {
+        let remaining = &input[index..];
+        let marker_len = if remaining.starts_with(BRACKETED_PASTE_END) {
+            Some(BRACKETED_PASTE_END.len())
+        } else if remaining.starts_with(BRACKETED_PASTE_START) {
+            Some(BRACKETED_PASTE_START.len())
+        } else {
+            None
+        };
+
+        if let Some(marker_len) = marker_len {
+            if sanitized.is_none() {
+                let mut buffer = Vec::with_capacity(input.len());
+                buffer.extend_from_slice(&input[..index]);
+                sanitized = Some(buffer);
+            }
+            index += marker_len;
+            continue;
+        }
+
+        if let Some(buffer) = sanitized.as_mut() {
+            buffer.push(input[index]);
+        }
+        index += 1;
+    }
+    sanitized
+}
+
+fn framed_bracketed_paste_input(input: &[u8]) -> Vec<u8> {
+    let sanitized = sanitize_bracketed_paste_input(input);
+    let payload = sanitized.as_deref().unwrap_or(input);
+    let mut framed =
+        Vec::with_capacity(BRACKETED_PASTE_START.len() + payload.len() + BRACKETED_PASTE_END.len());
+    framed.extend_from_slice(BRACKETED_PASTE_START);
+    framed.extend_from_slice(payload);
+    framed.extend_from_slice(BRACKETED_PASTE_END);
+    framed
+}
 
 #[derive(Clone, Debug)]
 pub struct TerminalConfig {
@@ -196,6 +240,17 @@ impl Pane {
 
     fn write(&self, bytes: &[u8]) {
         self.terminal.write(bytes);
+    }
+
+    fn paste(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.terminal.bracketed_paste_mode() {
+            self.write(&framed_bracketed_paste_input(bytes));
+        } else {
+            self.write(bytes);
+        }
     }
 
     fn respawn(&mut self, config: &TerminalConfig, command: Option<&str>) -> Result<()> {
@@ -454,6 +509,16 @@ impl Window {
             }
         } else {
             self.active_pane().write(bytes);
+        }
+    }
+
+    fn paste_input(&self, bytes: &[u8]) {
+        if self.synchronize_panes {
+            for pane in &self.panes {
+                pane.paste(bytes);
+            }
+        } else {
+            self.active_pane().paste(bytes);
         }
     }
 
@@ -1197,6 +1262,10 @@ impl Rmux {
         self.active_window().write_input(bytes);
     }
 
+    pub fn paste_active(&self, bytes: &[u8]) {
+        self.active_window().paste_input(bytes);
+    }
+
     pub fn handle_mouse(&mut self, mouse: WireMouse) -> bool {
         if self.forward_mouse(mouse) {
             return true;
@@ -1841,5 +1910,26 @@ fn format_key_byte(byte: u8) -> String {
         1..=26 => format!("C-{}", (b'a' + byte - 1) as char),
         0x1b => "C-[".to_string(),
         _ => format!("0x{byte:02x}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bracketed_paste_is_framed_once() {
+        assert_eq!(
+            framed_bracketed_paste_input("hello\nworld".as_bytes()),
+            b"\x1b[200~hello\nworld\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_strips_embedded_markers() {
+        assert_eq!(
+            framed_bracketed_paste_input(b"before\x1b[201~middle\x1b[200~after"),
+            b"\x1b[200~beforemiddleafter\x1b[201~"
+        );
     }
 }
