@@ -24,7 +24,9 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Run Rust tests
-        run: cargo test --locked
+        # libtermy's Unix PTYs use process-wide SIGCHLD delivery, so tests that
+        # own terminals must not compete for child-exit notifications.
+        run: cargo test --locked -- --test-threads=1
       - name: Check CLI startup
         run: cargo run --locked -- --help
       - name: Run detach/attach smoke test
