@@ -1886,7 +1886,10 @@ fn is_socket_closed(err: &anyhow::Error) -> bool {
     err.downcast_ref::<io::Error>().is_some_and(|io_err| {
         matches!(
             io_err.kind(),
-            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+            ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::NotConnected
+                | ErrorKind::UnexpectedEof
         )
     })
 }
@@ -3059,6 +3062,7 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         };
         assert_eq!(bottom_view.panes[0].scroll_offset, 0);
+        assert!(bottom_view.panes[0].cursor.is_some());
 
         assert!(app.handle_mouse(WireMouse {
             col: 2,
@@ -3068,6 +3072,7 @@ mod tests {
         }));
         let scrolled_up = app.session_view();
         assert!(scrolled_up.panes[0].scroll_offset > 0);
+        assert!(scrolled_up.panes[0].cursor.is_none());
         assert_ne!(scrolled_up.panes[0].lines, bottom_view.panes[0].lines);
 
         let offset = scrolled_up.panes[0].scroll_offset;
@@ -3087,7 +3092,9 @@ mod tests {
         }));
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
             .unwrap();
-        assert_eq!(app.session_view().panes[0].scroll_offset, 0);
+        let returned_to_bottom = app.session_view();
+        assert_eq!(returned_to_bottom.panes[0].scroll_offset, 0);
+        assert!(returned_to_bottom.panes[0].cursor.is_some());
     }
 
     #[test]

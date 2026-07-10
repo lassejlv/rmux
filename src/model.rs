@@ -52,10 +52,7 @@ pub fn build_session_view(raw: RawView) -> SessionView {
         let (cells, lines) = frame_cells_and_text_lines(&rp.frame, rp.max_width);
         let scroll_offset = rp.frame.display_offset;
         let history_size = rp.frame.history_size;
-        let cursor = rp.frame.cursor.map(|cursor| crate::protocol::CursorView {
-            col: cursor.col,
-            row: cursor.row,
-        });
+        let cursor = viewport_cursor(&rp.frame);
         panes.push(PaneView {
             id: rp.id,
             x: rp.rect.x,
@@ -88,6 +85,16 @@ pub fn build_session_view(raw: RawView) -> SessionView {
         message: raw.message,
         clipboard_text: raw.clipboard_text,
     }
+}
+
+fn viewport_cursor(frame: &TermyFrame) -> Option<crate::protocol::CursorView> {
+    if frame.display_offset != 0 {
+        return None;
+    }
+    frame.cursor.map(|cursor| crate::protocol::CursorView {
+        col: cursor.col,
+        row: cursor.row,
+    })
 }
 
 const DEFAULT_CELL_WIDTH: f32 = 9.0;
@@ -2165,7 +2172,7 @@ fn format_key_byte(byte: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use termy_core::{TermyCell, TermyColor};
+    use termy_core::{TerminalCursorState, TerminalCursorStyle, TermyCell, TermyColor};
 
     fn test_frame(cols: u16, rows: u16, cells: &[(usize, usize, char)]) -> TermyFrame {
         let color = TermyColor {
@@ -2210,6 +2217,24 @@ mod tests {
             framed_bracketed_paste_input(b"before\x1b[201~middle\x1b[200~after"),
             b"\x1b[200~beforemiddleafter\x1b[201~"
         );
+    }
+
+    #[test]
+    fn cursor_is_hidden_while_viewing_scrollback() {
+        let mut frame = test_frame(8, 2, &[]);
+        frame.cursor = Some(TerminalCursorState {
+            col: 3,
+            row: 1,
+            style: TerminalCursorStyle::Block,
+        });
+
+        assert_eq!(
+            viewport_cursor(&frame),
+            Some(crate::protocol::CursorView { col: 3, row: 1 })
+        );
+
+        frame.display_offset = 1;
+        assert_eq!(viewport_cursor(&frame), None);
     }
 
     #[test]
